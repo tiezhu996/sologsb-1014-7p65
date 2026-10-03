@@ -47,6 +47,7 @@ button { font: inherit; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #65d3a5; box-shadow: 0 0 0 4px rgba(101,211,165,.12); }
 .status-dot.has-error { background: #ff8f9d; box-shadow: 0 0 0 4px rgba(255,143,157,.12); }
 .topbar-separator { height: 15px; width: 1px; background: rgba(255,255,255,.25); margin: 0 4px; }
+.journal-status { font-variant-numeric: tabular-nums; opacity: .9; }
 .actions { display: flex; align-items: center; gap: 8px; }
 .actions .button { height: 34px; }
 .workspace {

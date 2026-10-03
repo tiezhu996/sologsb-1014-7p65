@@ -1,7 +1,21 @@
 import { redraw } from 'mithril';
 import type { ProofCheck, ProofDocument, ProofStep, ProofVersion } from './types';
+import {
+  bootWorkspace,
+  foldAll,
+  FORCE_FOLD_ENTRIES,
+  FOLD_IDLE_MS,
+  LEGACY_KEY,
+  persistCheckpointWithCompaction,
+  persistLogWithCompaction,
+  removeKey,
+  STACK_LIMIT,
+  StorageQuotaError,
+  type Checkpoint,
+  type EditLogEntry,
+  type EntryKind,
+} from './persistence';
 
-const STORAGE_KEY = 'sologsb-1014-proof-workspace-v1';
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 const clone = <T>(value: T): T => structuredClone(value);
 
@@ -52,27 +66,46 @@ function initialDocuments(): ProofDocument[] {
   ];
 }
 
-function loadDocuments(): ProofDocument[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return initialDocuments();
-    const parsed = JSON.parse(raw) as ProofDocument[];
-    return Array.isArray(parsed) && parsed.length ? parsed : initialDocuments();
-  } catch {
-    return initialDocuments();
-  }
-}
-
 export class ProofStore {
-  documents = loadDocuments();
-  activeId = this.documents[0]?.id ?? '';
-  selectedStepId = this.documents[0]?.steps[0]?.id ?? '';
-  compareVersionId = '';
+  documents: ProofDocument[];
+  activeId: string;
+  selectedStepId: string;
+  compareVersionId: string;
   dragStepId = '';
   lastInput: HTMLTextAreaElement | HTMLInputElement | null = null;
   undoStack: ProofDocument[][] = [];
   redoStack: ProofDocument[][] = [];
   toast = '';
+
+  /** 最近一次合并出的完整检查点（含文档、版本快照与截至该步的撤销/重做栈） */
+  private checkpoint: Checkpoint;
+  /** 检查点之上按编号顺序排列、尚未合并的编辑日志 */
+  private entries: EditLogEntry[] = [];
+  private foldTimer: number | undefined;
+  private quotaBlocked = false;
+  private lastCompactionNotice = 0;
+
+  constructor() {
+    // 重开页面：先读检查点，再按顺序重放未合并日志（含撤销栈恢复）
+    const boot = bootWorkspace(initialDocuments);
+    this.checkpoint = boot.checkpoint;
+    this.entries = boot.entries;
+    this.documents = clone(boot.checkpoint.documents);
+    this.undoStack = clone(boot.checkpoint.undoStack);
+    this.redoStack = clone(boot.checkpoint.redoStack);
+    this.activeId = boot.checkpoint.activeId;
+    this.selectedStepId = boot.checkpoint.selectedStepId;
+    this.compareVersionId = boot.checkpoint.compareVersionId;
+
+    // 引导后立即固化：把启动时重放的日志合并成检查点
+    try {
+      this.fold();
+      if (boot.reason === 'legacy') removeKey(LEGACY_KEY);
+    } catch {
+      /* 固化失败不阻塞使用，稍后的稳定合并会重试 */
+    }
+    if (boot.message) this.notify(boot.message);
+  }
 
   get current(): ProofDocument {
     return this.documents.find((item) => item.id === this.activeId) ?? this.documents[0];
@@ -87,35 +120,135 @@ export class ProofStore {
     return validate(this.current);
   }
 
-  save(): void {
-    this.current.updatedAt = new Date().toISOString();
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(this.documents));
+  /** 检查点与待合并日志状态，供界面展示持久化进度 */
+  get journalInfo(): { checkpointSeq: number; pending: number; foldedAt: string } {
+    return { checkpointSeq: this.checkpoint.seq, pending: this.entries.length, foldedAt: this.checkpoint.foldedAt };
   }
 
-  update(mutator: (document: ProofDocument) => void): void {
-    this.undoStack.push(clone(this.documents));
-    if (this.undoStack.length > 80) this.undoStack.shift();
-    this.redoStack = [];
+  /** Ctrl+S：立即把日志稳定合并成检查点 */
+  save(): void {
+    try {
+      this.fold();
+    } catch (error) {
+      this.handlePersistError(error);
+    }
+  }
+
+  /**
+   * 记录一次文档改动：
+   * 撤销栈在内存中维护，同时按步骤编号追加到浏览器编辑日志。
+   */
+  private record(kind: EntryKind, before: ProofDocument[]): void {
+    const after = clone(this.documents);
+    const seq = this.checkpoint.seq + this.entries.length + 1;
+    this.entries.push({
+      seq,
+      kind,
+      before,
+      after,
+      activeId: this.activeId,
+      selectedStepId: this.selectedStepId,
+      at: new Date().toISOString(),
+    });
+    this.persistLog();
+
+    // 连续改动较多时立即合并，否则停顿稳定后再合并
+    if (this.entries.length >= FORCE_FOLD_ENTRIES) {
+      window.clearTimeout(this.foldTimer);
+      try {
+        this.fold();
+      } catch (error) {
+        this.handlePersistError(error);
+      }
+    } else {
+      this.scheduleFold();
+    }
+  }
+
+  private persistLog(): void {
+    try {
+      const result = persistLogWithCompaction(this.checkpoint, this.entries);
+      this.checkpoint = result.checkpoint;
+      this.entries = result.entries;
+      this.quotaBlocked = false;
+      if (result.compacted) {
+        const now = Date.now();
+        if (now - this.lastCompactionNotice > 4000) {
+          this.lastCompactionNotice = now;
+          this.notify('存储空间紧张，已把最早的编辑日志分批压缩进检查点');
+        }
+      }
+    } catch (error) {
+      this.handlePersistError(error);
+    }
+  }
+
+  private handlePersistError(error: unknown): void {
+    if (error instanceof StorageQuotaError) {
+      if (!this.quotaBlocked) {
+        this.quotaBlocked = true;
+        this.notify('浏览器存储空间不足，且旧日志已压缩完，请先导出稿件再清理空间');
+      }
+      return;
+    }
+    throw error;
+  }
+
+  private scheduleFold(): void {
+    window.clearTimeout(this.foldTimer);
+    this.foldTimer = window.setTimeout(() => {
+      try {
+        this.fold();
+      } catch (error) {
+        this.handlePersistError(error);
+      }
+    }, FOLD_IDLE_MS);
+  }
+
+  /** 稳定后合并：重放全部未合并日志，落一份完整检查点并清空日志区 */
+  private fold(): void {
+    window.clearTimeout(this.foldTimer);
+    const merged = foldAll(this.checkpoint, this.entries);
+    const result = persistCheckpointWithCompaction(merged, []);
+    this.checkpoint = result.checkpoint;
+    this.entries = result.entries;
+    // 极端配额下可能裁掉了最旧的撤销栈层，内存栈与检查点保持一致
+    if (result.compacted) {
+      this.undoStack = clone(result.checkpoint.undoStack);
+      this.redoStack = clone(result.checkpoint.redoStack);
+    }
+    this.quotaBlocked = false;
+  }
+
+  update(mutator: (document: ProofDocument) => void, after?: () => void): void {
+    const before = clone(this.documents);
     mutator(this.current);
-    this.save();
+    after?.();
+    this.current.updatedAt = new Date().toISOString();
+    this.undoStack.push(before);
+    if (this.undoStack.length > STACK_LIMIT) this.undoStack.shift();
+    this.redoStack = [];
+    this.record('edit', before);
   }
 
   undo(): void {
     const previous = this.undoStack.pop();
     if (!previous) return;
-    this.redoStack.push(clone(this.documents));
+    const before = clone(this.documents);
+    this.redoStack.push(before);
     this.documents = previous;
     this.ensureSelection();
-    this.save();
+    this.record('undo', before);
   }
 
   redo(): void {
     const next = this.redoStack.pop();
     if (!next) return;
-    this.undoStack.push(clone(this.documents));
+    const before = clone(this.documents);
+    this.undoStack.push(before);
     this.documents = next;
     this.ensureSelection();
-    this.save();
+    this.record('redo', before);
   }
 
   selectDocument(id: string): void {
@@ -147,11 +280,14 @@ export class ProofStore {
       versions: [],
       updatedAt: new Date().toISOString(),
     };
-    this.undoStack.push(clone(this.documents));
+    const before = clone(this.documents);
+    this.undoStack.push(before);
+    if (this.undoStack.length > STACK_LIMIT) this.undoStack.shift();
+    this.redoStack = [];
     this.documents.unshift(document);
     this.activeId = id;
     this.selectedStepId = document.steps[0].id;
-    this.save();
+    this.record('edit', before);
   }
 
   removeDocument(id: string): void {
@@ -159,10 +295,14 @@ export class ProofStore {
       this.notify('至少保留一个证明文档');
       return;
     }
-    this.undoStack.push(clone(this.documents));
+    const before = clone(this.documents);
+    this.undoStack.push(before);
+    if (this.undoStack.length > STACK_LIMIT) this.undoStack.shift();
+    this.redoStack = [];
     this.documents = this.documents.filter((item) => item.id !== id);
     this.ensureSelection();
-    this.save();
+    this.current.updatedAt = new Date().toISOString();
+    this.record('edit', before);
   }
 
   addStep(type: ProofStep['type'] = 'derivation'): void {
@@ -179,8 +319,9 @@ export class ProofStore {
     this.update((document) => {
       const selectedIndex = document.steps.findIndex((item) => item.id === this.selectedStepId);
       document.steps.splice(type === 'goal' ? document.steps.length : selectedIndex + 1, 0, step);
+    }, () => {
+      this.selectedStepId = step.id;
     });
-    this.selectedStepId = step.id;
   }
 
   removeStep(id: string): void {
@@ -189,8 +330,7 @@ export class ProofStore {
       document.steps.forEach((step) => {
         step.references = step.references.filter((reference) => reference !== id);
       });
-    });
-    this.ensureSelection();
+    }, () => this.ensureSelection());
   }
 
   moveStep(sourceId: string, targetId: string): void {

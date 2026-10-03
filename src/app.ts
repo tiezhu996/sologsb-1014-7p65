@@ -110,7 +110,7 @@ export class ProofApp implements Component {
     if (command && event.key.toLowerCase() === 's') {
       event.preventDefault();
       store.save();
-      store.notify('已保存到浏览器');
+      store.notify('已保存：编辑日志合并为新的检查点');
       m.redraw();
       return;
     }
@@ -147,6 +147,10 @@ export class ProofApp implements Component {
     const warnings = checks.filter((check) => check.severity === 'warning').length;
     const selectedVersion = document.versions.find((version) => version.id === store.compareVersionId);
     const diff = selectedVersion ? compareVersion(document, selectedVersion) : [];
+    const journal = store.journalInfo;
+    const journalLabel = journal.pending > 0
+      ? `检查点 #${journal.checkpointSeq} · ${journal.pending} 步日志待合并`
+      : `检查点 #${journal.checkpointSeq} 已同步`;
 
     return m('div.app-shell', [
       m('header.topbar', [
@@ -158,7 +162,7 @@ export class ProofApp implements Component {
           m('span.status-dot', { class: errors ? 'has-error' : 'is-ok' }),
           errors ? `${errors} 个结构错误` : '证明结构可检查',
           m('span.topbar-separator'),
-          `自动保存于 ${new Date(document.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`,
+          m('span.journal-status', { title: `检查点合并于 ${new Date(journal.foldedAt).toLocaleString('zh-CN')}` }, journalLabel),
         ]),
         m('div.actions', [
           m('button.button.is-light', { onclick: () => { store.undo(); m.redraw(); }, disabled: !store.undoStack.length, title: '撤销 Ctrl+Z' }, '↶ 撤销'),
