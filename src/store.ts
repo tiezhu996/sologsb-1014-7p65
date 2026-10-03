@@ -1,7 +1,7 @@
 import { redraw } from 'mithril';
+import { WorkspaceStorage, type WorkspaceSnapshot } from './persistence';
 import type { ProofCheck, ProofDocument, ProofStep, ProofVersion } from './types';
 
-const STORAGE_KEY = 'sologsb-1014-proof-workspace-v1';
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 const clone = <T>(value: T): T => structuredClone(value);
 
@@ -52,27 +52,45 @@ function initialDocuments(): ProofDocument[] {
   ];
 }
 
-function loadDocuments(): ProofDocument[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return initialDocuments();
-    const parsed = JSON.parse(raw) as ProofDocument[];
-    return Array.isArray(parsed) && parsed.length ? parsed : initialDocuments();
-  } catch {
-    return initialDocuments();
-  }
-}
-
 export class ProofStore {
-  documents = loadDocuments();
-  activeId = this.documents[0]?.id ?? '';
-  selectedStepId = this.documents[0]?.steps[0]?.id ?? '';
-  compareVersionId = '';
+  private readonly storage: WorkspaceStorage;
+
+  documents: ProofDocument[];
+
+  activeId: string;
+
+  selectedStepId: string;
+
+  compareVersionId: string;
+
   dragStepId = '';
+
   lastInput: HTMLTextAreaElement | HTMLInputElement | null = null;
+
   undoStack: ProofDocument[][] = [];
+
   redoStack: ProofDocument[][] = [];
+
   toast = '';
+
+  constructor() {
+    this.storage = new WorkspaceStorage(globalThis.localStorage, initialDocuments);
+    const loaded = this.storage.load();
+    this.documents = loaded.snapshot.documents;
+    this.undoStack = loaded.snapshot.undoStack;
+    this.redoStack = loaded.snapshot.redoStack;
+    this.activeId = loaded.snapshot.activeId;
+    this.selectedStepId = loaded.snapshot.selectedStepId;
+    this.compareVersionId = loaded.snapshot.compareVersionId;
+    this.ensureSelection();
+    if (loaded.warning) {
+      this.toast = loaded.warning;
+      window.setTimeout(() => {
+        this.toast = '';
+        redraw();
+      }, 4000);
+    }
+  }
 
   get current(): ProofDocument {
     return this.documents.find((item) => item.id === this.activeId) ?? this.documents[0];
@@ -87,35 +105,46 @@ export class ProofStore {
     return validate(this.current);
   }
 
-  save(): void {
+  save(): boolean {
     this.current.updatedAt = new Date().toISOString();
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(this.documents));
+    try {
+      const checkpoint = this.storage.checkpointNow(this.snapshot());
+      this.applySnapshot(checkpoint);
+      return true;
+    } catch {
+      this.notify('检查点保存失败，已保留最近一次完整恢复点。');
+      return false;
+    }
   }
 
   update(mutator: (document: ProofDocument) => void): void {
-    this.undoStack.push(clone(this.documents));
-    if (this.undoStack.length > 80) this.undoStack.shift();
-    this.redoStack = [];
-    mutator(this.current);
-    this.save();
+    this.commit(() => mutator(this.current));
   }
 
   undo(): void {
+    const before = this.snapshot();
     const previous = this.undoStack.pop();
     if (!previous) return;
+
     this.redoStack.push(clone(this.documents));
     this.documents = previous;
     this.ensureSelection();
-    this.save();
+    this.current.updatedAt = new Date().toISOString();
+
+    this.persistTransition('undo', before, '撤销记录保存失败，已从最近检查点恢复。');
   }
 
   redo(): void {
+    const before = this.snapshot();
     const next = this.redoStack.pop();
     if (!next) return;
+
     this.undoStack.push(clone(this.documents));
     this.documents = next;
     this.ensureSelection();
-    this.save();
+    this.current.updatedAt = new Date().toISOString();
+
+    this.persistTransition('redo', before, '重做记录保存失败，已从最近检查点恢复。');
   }
 
   selectDocument(id: string): void {
@@ -133,6 +162,9 @@ export class ProofStore {
     if (!this.current?.steps.some((step) => step.id === this.selectedStepId)) {
       this.selectedStepId = this.current?.steps[0]?.id ?? '';
     }
+    if (!this.current?.versions.some((version) => version.id === this.compareVersionId)) {
+      this.compareVersionId = '';
+    }
   }
 
   addDocument(): void {
@@ -147,11 +179,12 @@ export class ProofStore {
       versions: [],
       updatedAt: new Date().toISOString(),
     };
-    this.undoStack.push(clone(this.documents));
-    this.documents.unshift(document);
-    this.activeId = id;
-    this.selectedStepId = document.steps[0].id;
-    this.save();
+    this.commit(() => {
+      this.documents.unshift(document);
+      this.activeId = id;
+      this.selectedStepId = document.steps[0].id;
+      this.compareVersionId = '';
+    });
   }
 
   removeDocument(id: string): void {
@@ -159,10 +192,10 @@ export class ProofStore {
       this.notify('至少保留一个证明文档');
       return;
     }
-    this.undoStack.push(clone(this.documents));
-    this.documents = this.documents.filter((item) => item.id !== id);
-    this.ensureSelection();
-    this.save();
+    this.commit(() => {
+      this.documents = this.documents.filter((item) => item.id !== id);
+      this.ensureSelection();
+    });
   }
 
   addStep(type: ProofStep['type'] = 'derivation'): void {
@@ -176,21 +209,21 @@ export class ProofStore {
       counterexample: '',
       alternative: '',
     };
-    this.update((document) => {
+    this.commit((document) => {
       const selectedIndex = document.steps.findIndex((item) => item.id === this.selectedStepId);
       document.steps.splice(type === 'goal' ? document.steps.length : selectedIndex + 1, 0, step);
+      this.selectedStepId = step.id;
     });
-    this.selectedStepId = step.id;
   }
 
   removeStep(id: string): void {
-    this.update((document) => {
+    this.commit((document) => {
       document.steps = document.steps.filter((step) => step.id !== id);
       document.steps.forEach((step) => {
         step.references = step.references.filter((reference) => reference !== id);
       });
+      this.ensureSelection();
     });
-    this.ensureSelection();
   }
 
   moveStep(sourceId: string, targetId: string): void {
@@ -235,6 +268,64 @@ export class ProofStore {
         redraw();
       }
     }, 2200);
+  }
+
+  private snapshot(): WorkspaceSnapshot {
+    return {
+      documents: clone(this.documents),
+      undoStack: clone(this.undoStack),
+      redoStack: clone(this.redoStack),
+      activeId: this.activeId,
+      selectedStepId: this.selectedStepId,
+      compareVersionId: this.compareVersionId,
+    };
+  }
+
+  private applySnapshot(snapshot: WorkspaceSnapshot): void {
+    this.documents = clone(snapshot.documents);
+    this.undoStack = clone(snapshot.undoStack);
+    this.redoStack = clone(snapshot.redoStack);
+    this.activeId = snapshot.activeId;
+    this.selectedStepId = snapshot.selectedStepId;
+    this.compareVersionId = snapshot.compareVersionId;
+    this.ensureSelection();
+  }
+
+  private commit(mutator: (document: ProofDocument) => void): void {
+    const before = this.snapshot();
+    try {
+      mutator(this.current);
+    } catch {
+      this.applySnapshot(before);
+      this.notify('改动未能完成，已恢复到操作前状态。');
+      return;
+    }
+
+    this.current.updatedAt = new Date().toISOString();
+    this.undoStack.push(before.documents);
+    if (this.undoStack.length > 80) this.undoStack.shift();
+    this.redoStack = [];
+
+    this.persistTransition('edit', before, '浏览器存储空间不足，已从最近检查点恢复。');
+  }
+
+  private persistTransition(kind: 'edit' | 'undo' | 'redo', fallback: WorkspaceSnapshot, message: string): void {
+    try {
+      const result = this.storage.append(kind, this.snapshot());
+      this.storage.scheduleCheckpoint(this.snapshot(), (checkpoint) => this.applySnapshot(checkpoint));
+      if (result.compacted) this.applySnapshot(this.storage.load().snapshot);
+    } catch {
+      this.recoverAfterFailure(fallback, message);
+    }
+  }
+
+  private recoverAfterFailure(fallback: WorkspaceSnapshot, message: string): void {
+    try {
+      this.applySnapshot(this.storage.load().snapshot);
+    } catch {
+      this.applySnapshot(fallback);
+    }
+    this.notify(message);
   }
 }
 

@@ -109,8 +109,7 @@ export class ProofApp implements Component {
     }
     if (command && event.key.toLowerCase() === 's') {
       event.preventDefault();
-      store.save();
-      store.notify('已保存到浏览器');
+      if (store.save()) store.notify('已合并为浏览器检查点');
       m.redraw();
       return;
     }
